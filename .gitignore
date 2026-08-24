@@ -14,10 +14,10 @@ __pycache__/
 # `.ipynb` is the student's executed deliverable.
 
 # Lab artifacts (regenerated on every run; do not commit)
-data/pref/
-data/eval_prompts.json
-adapters/sft-mini/
-adapters/dpo/
+adapters/sft-mini/*
+!adapters/sft-mini/adapter_config.json
+adapters/dpo/*
+!adapters/dpo/adapter_config.json
 adapters/orpo/
 adapters/merged-fp16/
 gguf/
