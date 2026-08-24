@@ -1,0 +1,22 @@
+{
+  "created_utc": "2026-08-24T15:40:34.776405+00:00",
+  "gpu": "Tesla T4",
+  "base_model": "Qwen/Qwen2.5-3B-Instruct",
+  "attention_implementation": "eager",
+  "versions": {
+    "torch": "2.11.0+cu128",
+    "transformers": "5.15.1",
+    "trl": "1.10.0",
+    "peft": "0.20.0",
+    "accelerate": "1.14.0",
+    "bitsandbytes": "0.50.1",
+    "datasets": "5.0.1"
+  },
+  "included": [
+    "adapters/sft-mini",
+    "adapters/dpo",
+    "data/pref",
+    "data/eval",
+    "submission/screenshots"
+  ]
+}

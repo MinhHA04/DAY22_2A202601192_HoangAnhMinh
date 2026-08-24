@@ -5,209 +5,225 @@
 # ---
 
 # %% [markdown]
-# # NB6 — LLM Benchmark: SFT-only vs SFT+DPO  (OPTIONAL / BONUS)
+# # NB6 — SFT-only vs SFT+DPO benchmark (OPTIONAL / BONUS)
 #
-# > **Optional (bonus).** Core lab = NB1--NB4. This runs lm-eval (~30 min on T4)
-# > and is skip-friendly --- do it only if you want quantitative deltas.
+# Runs IFEval, GSM8K and sampled MMLU with lm-eval 0.4.12, then an optional
+# AlpacaEval-lite pairwise judge. Each lm-eval invocation runs in its own process,
+# so GPU memory is released between adapters/tasks. The stack uses 4-bit
+# bitsandbytes + eager attention and never imports Unsloth/xFormers/FlashAttention.
 #
-# **Stack:** `lm-eval-harness` (IFEval, GSM8K, MMLU) + hand-rolled AlpacaEval-lite (judge-based).
-# Maps to deck §8.1–§8.5 (Đánh giá Alignment): static suites · judge-based suites · reward-model
-# evaluators · VN landscape.
-#
-# > **Mục tiêu:** chạy 4 benchmarks trên *cùng 1 base model* dưới 2 condition (SFT-only và
-# > SFT+DPO), thấy bằng số có gì tăng có gì giảm. Plot bar chart so sánh. Đây là cách *bạn* tự đo
-# > tương đương Tulu 3 stats §9.2b — không chỉ trích dẫn paper người khác.
-# >
-# > **Quan trọng đọc trước khi run:** deck §8.1 (vì sao đánh giá alignment khó). Một số
-# > benchmark có thể *giảm* sau DPO — đó là alignment tax (chat-tuning trade-off với reasoning),
-# > không phải bug. Document trong REFLECTION § 7.
+# T4 defaults are deliberately bounded. Override the `NB6_*` environment variables
+# for wider coverage.
 
 # %% [markdown]
-# ## 0. Setup
+# ## 0. Install benchmark dependencies and configure limits
 
 # %%
-import os
-import json
 import gc
+import json
+import math
+import os
+import random
+import subprocess
+import sys
+import time
 from pathlib import Path
 
-COMPUTE_TIER = os.environ.get("COMPUTE_TIER", "T4").upper()
+import torch
 
-if COMPUTE_TIER == "T4":
-    LIMIT_IFEVAL = 540
-    LIMIT_GSM8K = 500
-    LIMIT_MMLU = 500
-    LIMIT_ALPACA = 100
-    BATCH_SIZE = 1
-else:
-    LIMIT_IFEVAL = 540
-    LIMIT_GSM8K = 1319
-    LIMIT_MMLU = 5000
-    LIMIT_ALPACA = 250
-    BATCH_SIZE = 4
+subprocess.run(
+    [
+        sys.executable, "-m", "pip", "install", "-q",
+        "lm-eval[hf,ifeval,math]==0.4.12",
+    ],
+    check=True,
+    timeout=1200,
+)
+
+COMPUTE_TIER = os.environ.get("COMPUTE_TIER", "T4").upper()
+BASE_MODEL = "Qwen/Qwen2.5-3B-Instruct"
+# IFEval allows generations up to 1,280 tokens, so a 512-token context can
+# truncate or fail before the answer is complete. 2,048 remains safe at batch 1
+# for a 4-bit 3B model on a T4 and can be overridden without editing the file.
+EVAL_MAX_LEN = int(os.environ.get("NB6_MAX_LENGTH", "2048"))
+BATCH_SIZE = int(os.environ.get("NB6_BATCH_SIZE", "1"))
+LIMIT_IFEVAL = int(os.environ.get("NB6_LIMIT_IFEVAL", "100"))
+LIMIT_GSM8K = int(os.environ.get("NB6_LIMIT_GSM8K", "100"))
+# lm-eval applies group limits per MMLU subject; 10 means at most ~570 questions.
+LIMIT_MMLU_PER_SUBJECT = int(os.environ.get("NB6_LIMIT_MMLU_PER_SUBJECT", "10"))
+LIMIT_ALPACA = int(os.environ.get("NB6_LIMIT_ALPACA", "20"))
 
 REPO_ROOT = Path.cwd().parent if Path.cwd().name == "notebooks" else Path.cwd()
 SFT_PATH = REPO_ROOT / "adapters" / "sft-mini"
 DPO_PATH = REPO_ROOT / "adapters" / "dpo"
 EVAL_OUT = REPO_ROOT / "data" / "eval"
+SCREENSHOT_DIR = REPO_ROOT / "submission" / "screenshots"
 EVAL_OUT.mkdir(parents=True, exist_ok=True)
+SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
-assert SFT_PATH.exists(), "NB1 must run first"
-assert DPO_PATH.exists(), "NB3 must run first"
+for adapter in (SFT_PATH, DPO_PATH):
+    assert adapter.joinpath("adapter_config.json").exists(), f"Missing adapter: {adapter}"
+assert torch.cuda.is_available(), "NB6 requires a Colab GPU runtime"
 
-print(f"COMPUTE_TIER:    {COMPUTE_TIER}")
-print(f"IFEval:          {LIMIT_IFEVAL} prompts")
-print(f"GSM8K:           {LIMIT_GSM8K} problems")
-print(f"MMLU:            {LIMIT_MMLU} questions")
-print(f"AlpacaEval-lite: {LIMIT_ALPACA} prompts")
-print(f"output:          {EVAL_OUT}")
-
-# %%
-import torch
-
-assert torch.cuda.is_available(), "Need GPU. See HARDWARE-GUIDE.md."
+print(f"GPU: {torch.cuda.get_device_name(0)}")
+print(f"IFEval={LIMIT_IFEVAL}, GSM8K={LIMIT_GSM8K}, MMLU≤{57 * LIMIT_MMLU_PER_SUBJECT}")
+print(f"AlpacaEval-lite={LIMIT_ALPACA}, batch={BATCH_SIZE}, context={EVAL_MAX_LEN}")
 
 # %% [markdown]
-# ## 1. Helper — run lm-eval on a model+adapter pair
+# ## 1. Robust lm-eval runner
 
 # %%
-import subprocess
-
-
-def run_lm_eval(adapter_path, tasks, limit, num_fewshot, label):
-    """Run lm-eval-harness with PEFT adapter on top of base, return parsed metrics."""
-    base = "unsloth/Qwen2.5-3B-bnb-4bit" if COMPUTE_TIER == "T4" else "unsloth/Qwen2.5-7B-bnb-4bit"
-    out_dir = EVAL_OUT / f"lm-{label}-{tasks}"
+def run_lm_eval(adapter_path: Path, task: str, limit: int, num_fewshot: int, label: str):
+    """Evaluate one adapter/task in a child process and return the full result JSON."""
+    # A unique directory prevents a retry from accidentally reading stale JSON
+    # left by an earlier partial run.
+    out_dir = EVAL_OUT / f"lm-{label}-{task}-{time.time_ns()}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model_args = ",".join([
+        f"pretrained={BASE_MODEL}",
+        f"peft={adapter_path}",
+        "load_in_4bit=True",
+        "bnb_4bit_compute_dtype=float16",
+        "dtype=float16",
+        "attn_implementation=eager",
+        f"max_length={EVAL_MAX_LEN}",
+    ])
     cmd = [
-        "lm_eval",
+        sys.executable, "-m", "lm_eval",
         "--model", "hf",
-        "--model_args", f"pretrained={base},peft={adapter_path},load_in_4bit=True",
-        "--tasks", tasks,
+        "--model_args", model_args,
+        "--tasks", task,
         "--num_fewshot", str(num_fewshot),
         "--limit", str(limit),
         "--batch_size", str(BATCH_SIZE),
         "--device", "cuda:0",
+        "--apply_chat_template",
         "--output_path", str(out_dir),
     ]
-    print(f"\n{'=' * 60}\nRunning lm-eval [{label}]: {tasks}\n{'=' * 60}")
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=2400)
+    print(f"\n{'=' * 72}\n{label.upper()} · {task} · limit={limit}\n{'=' * 72}")
+    proc = subprocess.run(cmd, check=False, timeout=7200)
+    if proc.returncode != 0:
+        raise RuntimeError(f"lm-eval failed ({label}/{task}) with exit code {proc.returncode}")
+    result_files = sorted(out_dir.glob("**/results*.json"), key=lambda p: p.stat().st_mtime)
+    if not result_files:
+        raise FileNotFoundError(f"lm-eval wrote no results JSON under {out_dir}")
+    payload = json.loads(result_files[-1].read_text(encoding="utf-8"))
+    gc.collect()
+    torch.cuda.empty_cache()
+    return payload
 
-    out_files = sorted(out_dir.glob("**/results*.json"))
-    if not out_files:
-        print("WARN: lm-eval didn't write results JSON. STDOUT tail:")
-        print(proc.stdout[-1000:])
-        return {"error": "no_results"}
-    return json.loads(out_files[-1].read_text())["results"]
 
+def find_metric(payload, preferred_keys, task_prefix=None):
+    """Read a group metric or mean matching task metrics without guessing unrelated numbers."""
+    for container_name in ("groups", "results"):
+        container = payload.get(container_name, {})
+        for task_name, values in container.items():
+            if task_prefix and not (task_name == task_prefix or task_name.startswith(task_prefix + "_")):
+                continue
+            for key in preferred_keys:
+                if key in values and isinstance(values[key], (int, float)):
+                    return float(values[key])
+
+    if task_prefix:
+        per_task = []
+        for task_name, values in payload.get("results", {}).items():
+            if task_name.startswith(task_prefix + "_"):
+                for key in preferred_keys:
+                    if key in values and isinstance(values[key], (int, float)):
+                        per_task.append(float(values[key]))
+                        break
+        if per_task:
+            return sum(per_task) / len(per_task)
+    return float("nan")
 
 # %% [markdown]
-# ## 2. IFEval — Instruction-Following (programmatic)
-#
-# **What it tests:** can the model follow precise format instructions like "respond in 3 bullets."
-# 540 prompts, scored programmatically. No judge needed. **Why DPO matters:** chat alignment
-# is exactly the skill IFEval measures.
+# ## 2. IFEval
 
 # %%
-print(">>> SFT-only on IFEval")
-sft_ifeval = run_lm_eval(SFT_PATH, "ifeval", LIMIT_IFEVAL, num_fewshot=0, label="sft")
-gc.collect()
-torch.cuda.empty_cache()
-
-print(">>> SFT+DPO on IFEval")
-dpo_ifeval = run_lm_eval(DPO_PATH, "ifeval", LIMIT_IFEVAL, num_fewshot=0, label="dpo")
-gc.collect()
-torch.cuda.empty_cache()
+sft_ifeval_raw = run_lm_eval(SFT_PATH, "ifeval", LIMIT_IFEVAL, 0, "sft")
+dpo_ifeval_raw = run_lm_eval(DPO_PATH, "ifeval", LIMIT_IFEVAL, 0, "dpo")
 
 # %% [markdown]
-# ## 3. GSM8K — Grade-School Math (alignment tax probe)
-#
-# **What it tests:** 1.3K word problems, exact-match on the `####` final answer.
-# **Why DPO matters:** chat-aligned models often *lose* a few points on GSM8K (alignment tax).
+# ## 3. GSM8K
 
 # %%
-print(">>> SFT-only on GSM8K")
-sft_gsm8k = run_lm_eval(SFT_PATH, "gsm8k", LIMIT_GSM8K, num_fewshot=8, label="sft")
-gc.collect()
-torch.cuda.empty_cache()
-
-print(">>> SFT+DPO on GSM8K")
-dpo_gsm8k = run_lm_eval(DPO_PATH, "gsm8k", LIMIT_GSM8K, num_fewshot=8, label="dpo")
-gc.collect()
-torch.cuda.empty_cache()
+sft_gsm8k_raw = run_lm_eval(SFT_PATH, "gsm8k", LIMIT_GSM8K, 8, "sft")
+dpo_gsm8k_raw = run_lm_eval(DPO_PATH, "gsm8k", LIMIT_GSM8K, 8, "dpo")
 
 # %% [markdown]
-# ## 4. MMLU — Broad knowledge (sampled)
-#
-# **What it tests:** 14K MCQ across 57 subjects. T4 limit: 500. BigGPU: 5K.
-# **Why DPO matters:** if MMLU drops a lot, you've over-aligned (capacity loss).
+# ## 4. MMLU sampled across all subjects
 
 # %%
-print(">>> SFT-only on MMLU (sampled)")
-sft_mmlu = run_lm_eval(SFT_PATH, "mmlu", LIMIT_MMLU, num_fewshot=5, label="sft")
-gc.collect()
-torch.cuda.empty_cache()
-
-print(">>> SFT+DPO on MMLU (sampled)")
-dpo_mmlu = run_lm_eval(DPO_PATH, "mmlu", LIMIT_MMLU, num_fewshot=5, label="dpo")
-gc.collect()
-torch.cuda.empty_cache()
+sft_mmlu_raw = run_lm_eval(SFT_PATH, "mmlu", LIMIT_MMLU_PER_SUBJECT, 5, "sft")
+dpo_mmlu_raw = run_lm_eval(DPO_PATH, "mmlu", LIMIT_MMLU_PER_SUBJECT, 5, "dpo")
 
 # %% [markdown]
-# ## 5. AlpacaEval-lite — Win-rate vs reference (judge-based)
-#
-# Mini AlpacaEval 2 LC. 100 prompts, generate from both adapters, judge with gpt-4o-mini or
-# claude-haiku. Pure preference-style — closest in spirit to what DPO trained on.
-#
-# Falls back to "skipped" if no API key. Set `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` to enable.
+# ## 5. AlpacaEval-lite generation
 
 # %%
 from datasets import load_dataset
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 
-def load_alpaca_lite_prompts(n):
-    """Load first n prompts from tatsu-lab/alpaca_eval."""
-    try:
-        ds = load_dataset("tatsu-lab/alpaca_eval", "alpaca_eval",
-                          split="eval", trust_remote_code=True)
-        return [{"id": i, "prompt": ds[i]["instruction"]} for i in range(min(n, len(ds)))]
-    except Exception as exc:
-        print(f"alpaca_eval dataset load failed ({exc}); using NB4 fallback")
-        eval_path = EVAL_OUT / "prompts.json"
-        if eval_path.exists():
-            base = json.loads(eval_path.read_text())
-            return (base * (n // len(base) + 1))[:n]
-        return []
-
-
-alpaca_prompts = load_alpaca_lite_prompts(LIMIT_ALPACA)
-print(f"Loaded {len(alpaca_prompts)} AlpacaEval-lite prompts")
-
-# %%
-def generate_with_adapter(adapter_path, prompts, max_new_tokens=256):
-    """NB4 pattern: load base + adapter, generate, free memory."""
-    from unsloth import FastLanguageModel
-    from peft import PeftModel
-
-    base = "unsloth/Qwen2.5-3B-bnb-4bit" if COMPUTE_TIER == "T4" else "unsloth/Qwen2.5-7B-bnb-4bit"
-    max_len = 512 if COMPUTE_TIER == "T4" else 1024
-
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=base, max_seq_length=max_len, dtype=None, load_in_4bit=True,
+def load_alpaca_prompts(n):
+    # The Hub repo uses a legacy dataset script, which conflicts with datasets
+    # 5.x. Reading its official JSON directly avoids arbitrary-code loading.
+    dataset = load_dataset(
+        "json",
+        data_files=(
+            "https://huggingface.co/datasets/tatsu-lab/alpaca_eval/"
+            "resolve/main/alpaca_eval.json"
+        ),
+        split="train",
     )
+    indices = random.Random(42).sample(range(len(dataset)), k=min(n, len(dataset)))
+    return [
+        {"id": index, "prompt": dataset[index]["instruction"]}
+        for index in indices
+    ]
+
+
+def generate_with_adapter(adapter_path: Path, prompts, max_new_tokens=256):
+    quantization = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.float16,
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL,
+        quantization_config=quantization,
+        dtype=torch.float16,
+        device_map={"": 0},
+        attn_implementation="eager",
+        low_cpu_mem_usage=True,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(adapter_path, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = PeftModel.from_pretrained(model, str(adapter_path))
-    FastLanguageModel.for_inference(model)
+    model = PeftModel.from_pretrained(model, adapter_path, is_trainable=False)
+    model.config.use_cache = True
+    model.eval()
 
     outputs = []
-    for p in prompts:
-        msgs = [{"role": "user", "content": p["prompt"]}]
-        inp = tokenizer.apply_chat_template(msgs, return_tensors="pt",
-                                            add_generation_prompt=True).to("cuda")
-        with torch.no_grad():
-            out = model.generate(input_ids=inp, max_new_tokens=max_new_tokens,
-                                 do_sample=False, pad_token_id=tokenizer.eos_token_id)
-        outputs.append(tokenizer.decode(out[0][inp.shape[1]:], skip_special_tokens=True).strip())
+    for item in prompts:
+        model_inputs = tokenizer.apply_chat_template(
+            [{"role": "user", "content": item["prompt"]}],
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            add_generation_prompt=True,
+        ).to("cuda")
+        with torch.inference_mode():
+            generated = model.generate(
+                **model_inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        prompt_len = model_inputs["input_ids"].shape[1]
+        outputs.append(tokenizer.decode(generated[0][prompt_len:], skip_special_tokens=True).strip())
 
     del model, tokenizer
     gc.collect()
@@ -215,228 +231,250 @@ def generate_with_adapter(adapter_path, prompts, max_new_tokens=256):
     return outputs
 
 
+alpaca_prompts = load_alpaca_prompts(LIMIT_ALPACA)
+print(f"Loaded {len(alpaca_prompts)} AlpacaEval-lite prompts")
+sft_alpaca_outputs = generate_with_adapter(SFT_PATH, alpaca_prompts)
+dpo_alpaca_outputs = generate_with_adapter(DPO_PATH, alpaca_prompts)
+
+(EVAL_OUT / "alpaca_lite_generations.json").write_text(
+    json.dumps([
+        {**prompt, "sft": sft, "dpo": dpo}
+        for prompt, sft, dpo in zip(alpaca_prompts, sft_alpaca_outputs, dpo_alpaca_outputs)
+    ], ensure_ascii=False, indent=2),
+    encoding="utf-8",
+)
+
+# %% [markdown]
+# ## 6. Optional OpenAI pairwise judge
+#
+# Add a Colab Secret named `OPENAI_API_KEY`. If Colab Secrets times out, the
+# fallback prompt hides the key and keeps it only in kernel memory. Failed API
+# calls are marked `error` and are never counted as ties.
+
 # %%
-JUDGE_PROMPT = """You are evaluating two assistant responses for helpfulness.
+from getpass import getpass
+
+
+def load_openai_key():
+    if os.environ.get("OPENAI_API_KEY"):
+        return True
+    try:
+        from google.colab import userdata
+
+        value = userdata.get("OPENAI_API_KEY")
+        if value:
+            os.environ["OPENAI_API_KEY"] = value
+            return True
+    except Exception as exc:
+        print(f"Colab Secret unavailable ({type(exc).__name__}).")
+    value = getpass("Paste a NEW OPENAI_API_KEY (hidden, Enter to skip): ").strip()
+    if value:
+        os.environ["OPENAI_API_KEY"] = value
+        return True
+    return False
+
+
+# Match the already-reviewed NB4 judge; override with JUDGE_MODEL if required.
+JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "gpt-5-mini")
+JUDGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "winner": {"type": "string", "enum": ["A", "B", "tie"]},
+        "reason": {"type": "string"},
+    },
+    "required": ["winner", "reason"],
+    "additionalProperties": False,
+}
+
+
+def judge_pair(client, prompt, response_a, response_b):
+    judge_prompt = f"""Evaluate two assistant responses for helpfulness, correctness and relevance.
+Do not prefer a response merely because it is longer.
 
 User prompt: {prompt}
 
-Response A: {a}
+Response A: {response_a}
 
-Response B: {b}
-
-Which is more helpful, accurate, and on-topic? Answer with one of: "A", "B", or "tie".
-One-sentence justification.
-
-Output JSON: {{"winner": "A" | "B" | "tie", "reason": "..."}}"""
-
-
-def judge_pair(a, b, prompt):
-    if os.environ.get("OPENAI_API_KEY"):
-        from openai import OpenAI
-        client = OpenAI()
-        resp = client.chat.completions.create(
-            model=os.environ.get("JUDGE_MODEL", "gpt-4o-mini"),
-            messages=[{"role": "user", "content": JUDGE_PROMPT.format(prompt=prompt, a=a, b=b)}],
-            temperature=0,
-            response_format={"type": "json_object"},
-        )
-        try:
-            return json.loads(resp.choices[0].message.content)
-        except Exception:
-            return {"winner": "tie", "reason": "parse error"}
-    elif os.environ.get("ANTHROPIC_API_KEY"):
-        from anthropic import Anthropic
-        client = Anthropic()
-        resp = client.messages.create(
-            model=os.environ.get("JUDGE_MODEL", "claude-haiku-4-5"),
-            max_tokens=200,
-            messages=[{"role": "user", "content": JUDGE_PROMPT.format(prompt=prompt, a=a, b=b)}],
-        )
-        try:
-            return json.loads(resp.content[0].text)
-        except Exception:
-            return {"winner": "tie", "reason": "parse error"}
-    return None
-
-
-# %%
-import random
-
-if alpaca_prompts and (os.environ.get("OPENAI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")):
-    print(f">>> Generating SFT-only on {len(alpaca_prompts)} AlpacaEval-lite prompts")
-    sft_outputs = generate_with_adapter(SFT_PATH, alpaca_prompts)
-    print(f">>> Generating SFT+DPO")
-    dpo_outputs = generate_with_adapter(DPO_PATH, alpaca_prompts)
-
-    print(f">>> Judging {len(alpaca_prompts)} pairs (random A/B order)")
-    judgments = []
-    for p, sft_out, dpo_out in zip(alpaca_prompts, sft_outputs, dpo_outputs):
-        flip = random.random() < 0.5
-        if flip:
-            j = judge_pair(dpo_out, sft_out, p["prompt"])
-            if j and j.get("winner") in ("A", "B"):
-                j["winner_model"] = "dpo" if j["winner"] == "A" else "sft"
-        else:
-            j = judge_pair(sft_out, dpo_out, p["prompt"])
-            if j and j.get("winner") in ("A", "B"):
-                j["winner_model"] = "sft" if j["winner"] == "A" else "dpo"
-        if j and j.get("winner") == "tie":
-            j["winner_model"] = "tie"
-        judgments.append(j or {"winner_model": "skipped"})
-
-    n_dpo = sum(1 for j in judgments if j.get("winner_model") == "dpo")
-    n_tie = sum(1 for j in judgments if j.get("winner_model") == "tie")
-    n_total = len(judgments)
-    alpaca_winrate = (n_dpo + 0.5 * n_tie) / n_total if n_total else 0.0
-    print(f"\nDPO win-rate: {n_dpo}/{n_total} wins, {n_tie} ties → {alpaca_winrate:.3f}")
-    (EVAL_OUT / "alpaca_lite_judgments.json").write_text(
-        json.dumps(judgments, ensure_ascii=False, indent=2)
+Response B: {response_b}
+"""
+    request = dict(
+        model=JUDGE_MODEL,
+        input=judge_prompt,
+        max_output_tokens=1000,
+        store=False,
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "pairwise_judgment",
+                "strict": True,
+                "schema": JUDGE_SCHEMA,
+            }
+        },
     )
+    if JUDGE_MODEL.startswith("gpt-5"):
+        request["reasoning"] = {"effort": "minimal"}
+    response = client.responses.create(**request)
+    if response.status != "completed":
+        raise RuntimeError(
+            f"Judge status={response.status}; incomplete={response.incomplete_details}"
+        )
+    if not response.output_text:
+        raise RuntimeError("Judge completed without output_text")
+    return json.loads(response.output_text)
+
+
+judgments = []
+if load_openai_key():
+    from openai import OpenAI
+
+    client = OpenAI()
+    rng = random.Random(42)
+    for prompt, sft_output, dpo_output in zip(alpaca_prompts, sft_alpaca_outputs, dpo_alpaca_outputs):
+        flipped = rng.random() < 0.5
+        response_a, response_b = (dpo_output, sft_output) if flipped else (sft_output, dpo_output)
+        try:
+            result = judge_pair(client, prompt["prompt"], response_a, response_b)
+            winner = result["winner"]
+            if winner == "tie":
+                winner_model = "tie"
+            elif flipped:
+                winner_model = "dpo" if winner == "A" else "sft"
+            else:
+                winner_model = "sft" if winner == "A" else "dpo"
+            result.update({"id": prompt["id"], "winner_model": winner_model})
+        except Exception as exc:
+            result = {
+                "id": prompt["id"],
+                "winner_model": "error",
+                "reason": f"{type(exc).__name__}: {str(exc)[:200]}",
+            }
+        judgments.append(result)
 else:
-    print("⚠ No API key set, skipping AlpacaEval-lite. Set OPENAI_API_KEY or ANTHROPIC_API_KEY.")
-    alpaca_winrate = None
+    print("No API key supplied; AlpacaEval-lite judge skipped.")
+
+(EVAL_OUT / "alpaca_lite_judgments.json").write_text(
+    json.dumps(judgments, ensure_ascii=False, indent=2), encoding="utf-8"
+)
+
+valid_judgments = [item for item in judgments if item.get("winner_model") in {"sft", "dpo", "tie"}]
+if valid_judgments:
+    dpo_wins = sum(item["winner_model"] == "dpo" for item in valid_judgments)
+    sft_wins = sum(item["winner_model"] == "sft" for item in valid_judgments)
+    ties = sum(item["winner_model"] == "tie" for item in valid_judgments)
+    alpaca_dpo_score = (dpo_wins + 0.5 * ties) / len(valid_judgments)
+    alpaca_sft_score = (sft_wins + 0.5 * ties) / len(valid_judgments)
+else:
+    alpaca_dpo_score = float("nan")
+    alpaca_sft_score = float("nan")
+print(
+    f"Valid Alpaca judgments: {len(valid_judgments)}/{len(alpaca_prompts)}; "
+    f"SFT={alpaca_sft_score}, DPO={alpaca_dpo_score}"
+)
 
 # %% [markdown]
-# ## 6. Aggregate + 4-bar comparison plot
+# ## 7. Aggregate metrics, plot and save
 
 # %%
-def extract_score(results, primary_metric):
-    """Pull the primary metric from a lm-eval results dict."""
-    if "error" in results:
-        return float("nan")
-    for task_name, metrics_dict in results.items():
-        if primary_metric in metrics_dict:
-            return float(metrics_dict[primary_metric])
-        for k, v in metrics_dict.items():
-            if isinstance(v, (int, float)) and "acc" in k:
-                return float(v)
-    nums = [v for r in results.values() for v in r.values() if isinstance(v, (int, float))]
-    return sum(nums) / len(nums) if nums else float("nan")
-
-
 metrics = {
     "IFEval": {
-        "sft": extract_score(sft_ifeval, "prompt_level_strict_acc,none"),
-        "dpo": extract_score(dpo_ifeval, "prompt_level_strict_acc,none"),
+        "sft": find_metric(sft_ifeval_raw, ["prompt_level_strict_acc,none"], "ifeval"),
+        "dpo": find_metric(dpo_ifeval_raw, ["prompt_level_strict_acc,none"], "ifeval"),
     },
     "GSM8K": {
-        "sft": extract_score(sft_gsm8k, "exact_match,strict-match"),
-        "dpo": extract_score(dpo_gsm8k, "exact_match,strict-match"),
+        "sft": find_metric(sft_gsm8k_raw, ["exact_match,strict-match", "exact_match,none"], "gsm8k"),
+        "dpo": find_metric(dpo_gsm8k_raw, ["exact_match,strict-match", "exact_match,none"], "gsm8k"),
     },
     "MMLU": {
-        "sft": extract_score(sft_mmlu, "acc,none"),
-        "dpo": extract_score(dpo_mmlu, "acc,none"),
+        "sft": find_metric(sft_mmlu_raw, ["acc,none"], "mmlu"),
+        "dpo": find_metric(dpo_mmlu_raw, ["acc,none"], "mmlu"),
     },
     "AlpacaEval-lite": {
-        "sft": 0.5 if alpaca_winrate is not None else float("nan"),
-        "dpo": alpaca_winrate if alpaca_winrate is not None else float("nan"),
+        "sft": alpaca_sft_score,
+        "dpo": alpaca_dpo_score,
     },
 }
 
-print("\n" + "=" * 60)
-print("BENCHMARK RESULTS")
-print("=" * 60)
-for bench, scores in metrics.items():
-    delta = (scores["dpo"] - scores["sft"]) if all(s == s for s in scores.values()) else float("nan")
-    arrow = "↑" if delta > 0 else "↓" if delta < 0 else "—"
-    print(f"  {bench:18s}  SFT: {scores['sft']:.3f}   DPO: {scores['dpo']:.3f}   Δ: {delta:+.3f} {arrow}")
+print("\n" + "=" * 72 + "\nBENCHMARK RESULTS\n" + "=" * 72)
+for benchmark, scores in metrics.items():
+    delta = scores["dpo"] - scores["sft"]
+    print(f"{benchmark:18s} SFT={scores['sft']:.4f} DPO={scores['dpo']:.4f} Δ={delta:+.4f}")
 
 # %%
 import matplotlib.pyplot as plt
 import numpy as np
 
-bench_names = list(metrics.keys())
-sft_scores = [metrics[b]["sft"] for b in bench_names]
-dpo_scores = [metrics[b]["dpo"] for b in bench_names]
-
-x = np.arange(len(bench_names))
+names = list(metrics)
+sft_scores = [metrics[name]["sft"] for name in names]
+dpo_scores = [metrics[name]["dpo"] for name in names]
+x = np.arange(len(names))
 width = 0.36
 
-fig, ax = plt.subplots(figsize=(11, 5))
-b1 = ax.bar(x - width / 2, sft_scores, width, label="SFT-only", color="#2e548a")
-b2 = ax.bar(x + width / 2, dpo_scores, width, label="SFT+DPO", color="#c83538")
-
-for bars in [b1, b2]:
-    for rect in bars:
-        h = rect.get_height()
-        if h == h:
-            ax.text(rect.get_x() + rect.get_width() / 2, h + 0.005,
-                    f"{h:.2f}", ha="center", va="bottom", fontsize=9)
-
-for i, b in enumerate(bench_names):
-    s, d = metrics[b]["sft"], metrics[b]["dpo"]
-    if s == s and d == d:
-        delta = d - s
-        color = "#2e548a" if delta > 0 else "#c83538" if delta < 0 else "#666"
-        ax.annotate(f"Δ={delta:+.3f}", xy=(x[i], max(s, d) + 0.04),
-                    ha="center", fontsize=9, color=color, fontweight="bold")
-
+fig, ax = plt.subplots(figsize=(11, 5.5))
+sft_bars = ax.bar(x - width / 2, sft_scores, width, label="SFT-only", color="#2e548a")
+dpo_bars = ax.bar(x + width / 2, dpo_scores, width, label="SFT+DPO", color="#c83538")
+for bars in (sft_bars, dpo_bars):
+    for bar in bars:
+        height = bar.get_height()
+        if not math.isnan(height):
+            ax.text(bar.get_x() + bar.get_width() / 2, height + 0.012, f"{height:.3f}", ha="center", fontsize=9)
+for index, name in enumerate(names):
+    sft_score, dpo_score = metrics[name]["sft"], metrics[name]["dpo"]
+    if not (math.isnan(sft_score) or math.isnan(dpo_score)):
+        ax.text(index, max(sft_score, dpo_score) + 0.07, f"Δ={dpo_score - sft_score:+.3f}", ha="center")
 ax.set_xticks(x)
-ax.set_xticklabels(bench_names)
-ax.set_ylabel("Score (acc / win-rate)")
-ax.set_ylim(0, 1.05)
-ax.axhline(0.5, color="#888", linestyle=":", linewidth=0.7, alpha=0.5)
-ax.set_title(f"Benchmark comparison: SFT-only vs SFT+DPO  ·  {COMPUTE_TIER}")
-ax.legend(loc="upper right")
+ax.set_xticklabels(names)
+ax.set_ylabel("Score")
+ax.set_ylim(0, 1.12)
+ax.set_title("NB6 benchmark · SFT-only vs SFT+DPO · T4")
+ax.legend()
 ax.grid(True, axis="y", alpha=0.3)
 fig.tight_layout()
-
-screenshot_dir = REPO_ROOT / "submission" / "screenshots"
-screenshot_dir.mkdir(parents=True, exist_ok=True)
-fig.savefig(screenshot_dir / "07-benchmark-comparison.png", dpi=120, bbox_inches="tight")
+benchmark_png = SCREENSHOT_DIR / "07-benchmark-comparison.png"
+fig.savefig(benchmark_png, dpi=140, bbox_inches="tight")
 plt.show()
 
-# %% [markdown]
-# ## 7. Save results JSON (consumed by `make verify`)
-
 # %%
-final = {
+benchmark_results = {
     "compute_tier": COMPUTE_TIER,
+    "base_model": BASE_MODEL,
+    "lm_eval_version": "0.4.12",
     "limits": {
         "ifeval": LIMIT_IFEVAL,
         "gsm8k": LIMIT_GSM8K,
-        "mmlu": LIMIT_MMLU,
+        "mmlu_per_subject": LIMIT_MMLU_PER_SUBJECT,
         "alpaca_lite": LIMIT_ALPACA,
     },
     "metrics": metrics,
-    "deltas": {b: metrics[b]["dpo"] - metrics[b]["sft"]
-               for b in bench_names if metrics[b]["sft"] == metrics[b]["sft"]},
+    "deltas": {
+        name: scores["dpo"] - scores["sft"]
+        for name, scores in metrics.items()
+        if not (math.isnan(scores["sft"]) or math.isnan(scores["dpo"]))
+    },
+    "alpaca_valid_judgments": len(valid_judgments),
 }
-(EVAL_OUT / "benchmark_results.json").write_text(
-    json.dumps(final, ensure_ascii=False, indent=2)
+
+
+def json_safe(value):
+    """Replace non-finite floats so the saved artifact is strict JSON."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [json_safe(item) for item in value]
+    return value
+
+
+benchmark_path = EVAL_OUT / "benchmark_results.json"
+benchmark_path.write_text(
+    json.dumps(json_safe(benchmark_results), ensure_ascii=False, indent=2, allow_nan=False),
+    encoding="utf-8",
 )
-print(f"\nSaved {EVAL_OUT / 'benchmark_results.json'}")
+print(f"Saved {benchmark_path}")
+print(f"Saved {benchmark_png}")
 
 # %% [markdown]
-# ## 8. Vibe-coding callout — interpret your numbers
+# ## 8. Submission follow-up
 #
-# Câu hỏi để brainstorm trước khi viết REFLECTION § 7:
-#
-# 1. **Benchmark nào tăng nhiều nhất?** Nếu IFEval tăng nhiều, DPO đã làm đúng việc của nó
-#    (chat-tuning). Nếu AlpacaEval-lite tăng nhiều → preference signal transfer tốt.
-#
-# 2. **Benchmark nào *giảm*?** GSM8K hoặc MATH giảm = **alignment tax** kinh điển (deck §8.1).
-#    Đó không phải bug; đó là trade-off:
-#    - Capacity được dành cho format (theo lệnh) thay vì reasoning sâu
-#    - Chat data thường ngắn hơn math derivation → model học output ngắn hơn
-#
-# 3. **MMLU thay đổi ít hay nhiều?** MMLU đo *kiến thức nền*. DPO trên preference data thường
-#    KHÔNG dạy facts mới → MMLU thường flat (±2pp). Nếu giảm > 5pp → catastrophic forgetting,
-#    giảm β hoặc giảm epochs.
-#
-# 4. **AlpacaEval-lite có khớp với NB4 judge eval không?** Cả 2 đều judge-based nhưng prompt
-#    distribution khác nhau (NB4: 8 fixed, mix helpfulness+safety; AlpacaEval-lite: 100,
-#    helpfulness-focused). Kết quả khác = signal về *prompt distribution sensitivity*.
-#
-# **Vibe-coding tip (xem `VIBE-CODING.md` Phần 2 § Common workflows):** bạn có thể tự động hoá
-# với Claude Code:
-#
-# ```
-# claude --permission-mode plan -p "Read data/eval/benchmark_results.json
-# and submission/REFLECTION.md, propose a draft for § 7 (≥ 150 words) interpreting
-# the deltas. Reference deck §8.1 for alignment tax framing."
-# ```
-#
-# ---
-#
-# **Bạn vừa hoàn thành full Lab 22 pipeline.** Run `make verify` để check submission readiness.
+# Copy the four scores and deltas from `benchmark_results.json` into Reflection §7.
+# Explain whether IFEval improved and whether GSM8K/MMLU show an alignment tax.
